@@ -5,6 +5,19 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class PredictAllRequest(BaseModel):
+    """POST /predict/all body. Required non-empty symbols list."""
+
+    symbols: list[str] = Field(..., min_length=1, description="List of symbols to predict (e.g. AAPL, MSFT)")
+
+
+class PredictAllItem(BaseModel):
+    """Single prediction item for /predict/all response."""
+
+    symbol: str = Field(..., description="Symbol")
+    predicted_price: float = Field(..., description="Predicted price")
+
+
 class PredictRequest(BaseModel):
     """POST /predict body. Send currentPrice so direction matches (current − predicted)."""
 

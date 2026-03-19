@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 import xgboost as xgb
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -70,6 +71,18 @@ def health():
     return {"status": "ok"}
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    """Return { error: message } for validation errors (e.g. malformed /predict/all body)."""
+    errs = exc.errors()
+    msg = errs[0]["msg"] if errs else "Invalid request"
+    if errs and "loc" in errs[0] and errs[0]["loc"]:
+        loc = errs[0]["loc"]
+        if "symbols" in str(loc):
+            msg = "symbols is required and must be a non-empty array of strings"
+    return JSONResponse(status_code=422, content={"error": msg})
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request, exc):
     """Return JSON for 5xx; let FastAPI handle HTTPException (4xx) with JSON detail."""
@@ -77,5 +90,5 @@ async def unhandled_exception_handler(request, exc):
         raise exc
     return JSONResponse(
         status_code=500,
-        content={"detail": str(exc) or "Internal server error"},
+        content={"error": str(exc) or "Internal server error"},
     )
