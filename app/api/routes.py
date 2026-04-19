@@ -4,7 +4,7 @@ from fastapi import APIRouter, Request
 
 from app.schemas.predict import PredictRequest, PredictResponse, PredictAllRequest
 from app.schemas.candlestick import CandlestickPredictRequest, CandlestickPredictResponse
-from app.services.prediction_service import get_prediction, get_prediction_from_yahoo
+from app.services.prediction_service import get_prediction, get_prediction_from_yahoo, predict_all_from_yahoo
 from app.services.candlestick_service import predict_candlestick
 from app.core.exceptions import invalid_symbol_error, server_error, error_response
 
@@ -56,16 +56,15 @@ def predict_all(request: Request, body: PredictAllRequest):
     reg = getattr(request.app.state, "reg", None)
     use_yahoo = clf is not None and reg is not None
 
+    if use_yahoo:
+        return predict_all_from_yahoo(normalized, clf, reg, current_prices=body.current_prices)
+
     predictions: list[dict] = []
     for symbol in normalized:
         try:
-            if use_yahoo:
-                resp = get_prediction_from_yahoo(symbol, clf, reg, current_price_from_request=None)
-            else:
-                resp = get_prediction(symbol)
+            resp = get_prediction(symbol)
             predictions.append({"symbol": symbol, "predicted_price": resp.predicted_price})
-        except Exception as e:
-            # On per-symbol failure: include symbol with null predicted_price (frontend expects null for invalid/missing)
+        except Exception:
             predictions.append({"symbol": symbol, "predicted_price": None})
 
     return predictions

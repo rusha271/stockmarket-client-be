@@ -1,5 +1,7 @@
 """Candlestick XGBoost prediction: classifier (Bullish/Bearish) + regression (price-change category)."""
 
+import math
+
 import numpy as np
 import xgboost as xgb
 
@@ -47,14 +49,18 @@ def predict_candlestick(
     and compute predicted_price. When use_5min_bins=True (default), uses smaller
     percentage bins to minimize price difference for next 5-min prediction.
     """
+    if not math.isfinite(float(current_close)) or current_close <= 0:
+        raise ValueError("current_close must be a positive finite number")
+
     n = get_num_features(clf) or get_num_features(reg) or len(features)
     row = _prepare_features(features, n)
     d = xgb.DMatrix(row)
 
     prob = float(clf.predict(d)[0])
+    if not math.isfinite(prob):
+        prob = 0.5
     if not (0 <= prob <= 1):
         try:
-            import math
             prob = 1.0 / (1.0 + math.exp(-prob))
         except Exception:
             prob = 0.5
@@ -62,12 +68,18 @@ def predict_candlestick(
     direction = "Bullish" if probability > 0.5 else "Bearish"
 
     cat_raw = reg.predict(d)[0]
-    category = int(round(float(cat_raw)))
-    category = max(0, min(7, category))
+    cat_f = float(cat_raw)
+    if not math.isfinite(cat_f):
+        category = 3
+    else:
+        category = int(round(cat_f))
+        category = max(0, min(7, category))
     pct_map = CATEGORY_TO_PCT_5MIN if use_5min_bins else CATEGORY_TO_PCT
     price_change_pct = pct_map[category]
 
     predicted_price = round(current_close * (1 + price_change_pct / 100.0), 2)
+    if not math.isfinite(predicted_price):
+        predicted_price = round(current_close, 2)
 
     return CandlestickPredictResponse(
         direction=direction,

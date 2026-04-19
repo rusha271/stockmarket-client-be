@@ -8,7 +8,14 @@ from pydantic import BaseModel, ConfigDict, Field
 class PredictAllRequest(BaseModel):
     """POST /predict/all body. Required non-empty symbols list."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     symbols: list[str] = Field(..., min_length=1, description="List of symbols to predict (e.g. AAPL, MSFT)")
+    current_prices: dict[str, float] | None = Field(
+        None,
+        alias="currentPrices",
+        description="Optional live last prices by symbol (matches frontend); used when Yahoo OHLC succeeds for alignment",
+    )
 
 
 class PredictAllItem(BaseModel):

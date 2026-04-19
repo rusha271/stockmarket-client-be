@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 from typing import Literal
 
 from app.schemas.predict import Factors, PredictResponse
@@ -25,6 +26,19 @@ def direction_from_current_vs_predicted(current_price: float, predicted_price: f
 def _normalize_symbol(symbol: str) -> str:
     """Normalize symbol to uppercase and strip."""
     return (symbol or "").strip().upper()
+
+
+def _json_safe_predicted_price(value: float | None) -> float | None:
+    """JSON cannot encode NaN/Inf; treat as missing prediction."""
+    if value is None:
+        return None
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(x):
+        return None
+    return round(x, 2)
 
 
 def _symbol_seed(symbol: str) -> int:
@@ -135,9 +149,12 @@ def _candlestick_to_predict_response(
     ]
     from app.services.next_timeframe import get_next_5min_candle_ist
     timeframe = timeframe_str or get_next_5min_candle_ist()
+    if not math.isfinite(predicted_price):
+        predicted_price = round(current_used, 2)
+    conf = cr.probability if math.isfinite(cr.probability) else 0.5
     return PredictResponse(
         predicted_price=predicted_price,
-        confidence=cr.probability,
+        confidence=conf,
         direction=direction,
         timeframe=timeframe,
         reasoning=reasoning,
@@ -146,11 +163,52 @@ def _candlestick_to_predict_response(
     )
 
 
-def get_prediction_from_yahoo(symbol: str, clf, reg, current_price_from_request: float | None = None) -> PredictResponse:
+def _predict_from_candles(
+    sym: str,
+    candles: list[dict],
+    clf,
+    reg,
+    current_price_from_request: float | None,
+) -> PredictResponse:
+    from app.services.feature_builder import build_features_from_candles
+    from app.services.candlestick_service import predict_candlestick, get_num_features
+    from app.services.next_timeframe import get_next_5min_candle_ist, is_peak_hours_ist
+
+    if len(candles) < 8:
+        raise ValueError(f"Not enough candles: {len(candles)}")
+
+    n = get_num_features(clf) or get_num_features(reg) or 49
+    features = build_features_from_candles(candles, n)
+    current_close = float(candles[-1]["close"])
+    if not math.isfinite(current_close) or current_close <= 0:
+        raise ValueError("Invalid close price")
+
+    use_small_bins = not is_peak_hours_ist()
+    cr = predict_candlestick(features, current_close, clf, reg, use_5min_bins=use_small_bins)
+    current_for_direction = (
+        current_price_from_request
+        if current_price_from_request is not None and current_price_from_request > 0
+        else current_close
+    )
+    return _candlestick_to_predict_response(
+        cr,
+        timeframe_str=get_next_5min_candle_ist(),
+        current_price_for_direction=current_for_direction,
+    )
+
+
+def get_prediction_from_yahoo(
+    symbol: str,
+    clf,
+    reg,
+    current_price_from_request: float | None = None,
+    *,
+    allow_mock_on_failure: bool = True,
+) -> PredictResponse:
     """
     Fetch 6 days OHLC from Yahoo, run candlestick model, return frontend response.
     When current_price_from_request is sent (frontend live price), direction uses (current − predicted).
-    On failure, falls back to mock get_prediction(symbol).
+    On failure: mock get_prediction(symbol) only if allow_mock_on_failure is True.
     """
     sym = _normalize_symbol(symbol)
     if not sym:
@@ -158,28 +216,53 @@ def get_prediction_from_yahoo(symbol: str, clf, reg, current_price_from_request:
 
     try:
         from app.services.yahoo_ohlc import fetch_ohlc
-        from app.services.feature_builder import build_features_from_candles
-        from app.services.candlestick_service import predict_candlestick, get_num_features
 
         candles = fetch_ohlc(sym, days=6, interval="5m", last_n=40)
-        if len(candles) < 8:
-            raise ValueError(f"Not enough candles: {len(candles)}")
-
-        n = get_num_features(clf) or get_num_features(reg) or 49
-        features = build_features_from_candles(candles, n)
-        current_close = candles[-1]["close"]
-        if current_close <= 0:
-            raise ValueError("Invalid close price")
-
-        from app.services.next_timeframe import get_next_5min_candle_ist, is_peak_hours_ist
-        use_small_bins = not is_peak_hours_ist()  # no small bins during morning/evening peak
-        cr = predict_candlestick(features, current_close, clf, reg, use_5min_bins=use_small_bins)
-        current_for_direction = current_price_from_request if current_price_from_request is not None and current_price_from_request > 0 else current_close
-        return _candlestick_to_predict_response(
-            cr,
-            timeframe_str=get_next_5min_candle_ist(),
-            current_price_for_direction=current_for_direction,
-        )
+        return _predict_from_candles(sym, candles, clf, reg, current_price_from_request)
     except Exception as e:
-        logger.warning("Yahoo/model prediction failed for %s: %s; using mock.", sym, e)
-        return get_prediction(symbol)
+        logger.warning("Yahoo/model prediction failed for %s: %s", sym, e)
+        if allow_mock_on_failure:
+            logger.info("Using mock prediction for %s.", sym)
+            return get_prediction(symbol)
+        raise
+
+
+def predict_all_from_yahoo(
+    symbols: list[str],
+    clf,
+    reg,
+    current_prices: dict[str, float] | None = None,
+) -> list[dict[str, object]]:
+    """
+    Batch Yahoo OHLC + model for many symbols (one network round-trip when possible).
+    Symbols with no usable OHLC get predicted_price None (no mock — avoids bogus prices like TATAMOTORS).
+    """
+    from app.services.yahoo_ohlc import fetch_ohlc_batch
+
+    prices: dict[str, float] = {}
+    if current_prices:
+        for k, v in current_prices.items():
+            ks = _normalize_symbol(k)
+            if ks and v is not None and v > 0:
+                prices[ks] = float(v)
+
+    candles_map = fetch_ohlc_batch(symbols, days=6, interval="5m", last_n=40)
+    out: list[dict[str, object]] = []
+
+    for raw in symbols:
+        sym = _normalize_symbol(raw)
+        if not sym:
+            continue
+        candles = candles_map.get(sym)
+        if not candles or len(candles) < 8:
+            out.append({"symbol": sym, "predicted_price": None})
+            continue
+        try:
+            resp = _predict_from_candles(sym, candles, clf, reg, prices.get(sym))
+            safe = _json_safe_predicted_price(resp.predicted_price)
+            out.append({"symbol": sym, "predicted_price": safe})
+        except Exception as e:
+            logger.warning("Model prediction failed for %s: %s", sym, e)
+            out.append({"symbol": sym, "predicted_price": None})
+
+    return out

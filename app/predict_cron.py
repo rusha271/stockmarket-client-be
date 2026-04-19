@@ -53,7 +53,7 @@ def _get_actual_price(symbol: str) -> float | None:
 
 def run_predictions_for_all(clf, reg) -> list[dict]:
     """Run prediction for each Nifty 50 symbol; return list of {symbol, current_price, predicted_price}."""
-    from app.services.yahoo_ohlc import fetch_ohlc
+    from app.services.yahoo_ohlc import fetch_ohlc_batch
     from app.services.feature_builder import build_features_from_candles
     from app.services.candlestick_service import predict_candlestick, get_num_features
     from app.services.next_timeframe import is_peak_hours_ist
@@ -62,10 +62,12 @@ def run_predictions_for_all(clf, reg) -> list[dict]:
     use_small_bins = not is_peak_hours_ist()
     n = get_num_features(clf) or get_num_features(reg) or 49
 
+    candles_map = fetch_ohlc_batch(NIFTY_50_SYMBOLS, days=6, interval="5m", last_n=40)
+
     for symbol in NIFTY_50_SYMBOLS:
         try:
-            candles = fetch_ohlc(symbol, days=6, interval="5m", last_n=40)
-            if len(candles) < 8:
+            candles = candles_map.get(symbol)
+            if not candles or len(candles) < 8:
                 continue
             features = build_features_from_candles(candles, n)
             current_close = candles[-1]["close"]
