@@ -1,5 +1,5 @@
 venv
-app/models/
+# app/models/
 app/data/
 __pycache__/
 *.pyc
