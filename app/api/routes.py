@@ -1,5 +1,7 @@
 """API route handlers."""
 
+import os
+
 from fastapi import APIRouter, Request
 
 from app.schemas.predict import PredictRequest, PredictResponse, PredictAllRequest
@@ -9,6 +11,7 @@ from app.services.candlestick_service import predict_candlestick
 from app.core.exceptions import invalid_symbol_error, server_error, error_response
 
 router = APIRouter()
+PREDICT_ALL_MAX_SYMBOLS = max(1, int(os.getenv("PREDICT_ALL_MAX_SYMBOLS", "20")))
 
 
 @router.post("/predict", response_model=PredictResponse)
@@ -42,6 +45,11 @@ def predict_all(request: Request, body: PredictAllRequest):
     symbols_raw = body.symbols
     if not symbols_raw:
         return error_response("symbols is required and must be non-empty", status_code=422)
+    if len(symbols_raw) > PREDICT_ALL_MAX_SYMBOLS:
+        return error_response(
+            f"Maximum {PREDICT_ALL_MAX_SYMBOLS} symbols are allowed per request",
+            status_code=422,
+        )
 
     normalized: list[str] = []
     for s in symbols_raw:

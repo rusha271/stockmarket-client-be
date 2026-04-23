@@ -5,12 +5,23 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 
 from app.schemas.predict import Factors, PredictResponse
 from app.schemas.candlestick import CandlestickPredictResponse
 
 logger = logging.getLogger(__name__)
+
+# Tuned defaults for small instances (e.g., t3.small).
+PREDICT_ALL_MAX_WORKERS = max(1, int(os.getenv("PREDICT_ALL_MAX_WORKERS", "3")))
+PREDICT_ALL_CACHE_TTL_SECONDS = max(1, int(os.getenv("PREDICT_ALL_CACHE_TTL_SECONDS", "30")))
+
+_predict_all_cache_lock = threading.Lock()
+_predict_all_cache: dict[str, tuple[float, float | None]] = {}
 
 
 def direction_from_current_vs_predicted(current_price: float, predicted_price: float) -> Literal["up", "down", "neutral"]:
@@ -246,23 +257,78 @@ def predict_all_from_yahoo(
             if ks and v is not None and v > 0:
                 prices[ks] = float(v)
 
+    started_at = time.perf_counter()
     candles_map = fetch_ohlc_batch(symbols, days=6, interval="5m", last_n=40)
+    yahoo_elapsed_ms = (time.perf_counter() - started_at) * 1000.0
     out: list[dict[str, object]] = []
+    now = time.time()
 
+    def _cache_get(sym: str) -> tuple[bool, float | None]:
+        with _predict_all_cache_lock:
+            item = _predict_all_cache.get(sym)
+        if not item:
+            return False, None
+        ts, value = item
+        if now - ts > PREDICT_ALL_CACHE_TTL_SECONDS:
+            with _predict_all_cache_lock:
+                # Best-effort cleanup for expired items.
+                curr = _predict_all_cache.get(sym)
+                if curr and curr[0] == ts:
+                    _predict_all_cache.pop(sym, None)
+            return False, None
+        return True, value
+
+    def _cache_set(sym: str, value: float | None) -> None:
+        with _predict_all_cache_lock:
+            _predict_all_cache[sym] = (time.time(), value)
+
+    ordered_symbols: list[str] = []
     for raw in symbols:
         sym = _normalize_symbol(raw)
-        if not sym:
+        if sym:
+            ordered_symbols.append(sym)
+
+    results_by_symbol: dict[str, float | None] = {}
+    to_compute: list[str] = []
+    for sym in ordered_symbols:
+        found, cached = _cache_get(sym)
+        if found:
+            results_by_symbol[sym] = cached
             continue
+        to_compute.append(sym)
+
+    def _predict_symbol(sym: str) -> tuple[str, float | None]:
         candles = candles_map.get(sym)
         if not candles or len(candles) < 8:
-            out.append({"symbol": sym, "predicted_price": None})
-            continue
+            return sym, None
         try:
             resp = _predict_from_candles(sym, candles, clf, reg, prices.get(sym))
-            safe = _json_safe_predicted_price(resp.predicted_price)
-            out.append({"symbol": sym, "predicted_price": safe})
+            return sym, _json_safe_predicted_price(resp.predicted_price)
         except Exception as e:
             logger.warning("Model prediction failed for %s: %s", sym, e)
-            out.append({"symbol": sym, "predicted_price": None})
+            return sym, None
+
+    if to_compute:
+        workers = min(PREDICT_ALL_MAX_WORKERS, len(to_compute))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_predict_symbol, sym) for sym in to_compute]
+            for fut in as_completed(futures):
+                sym, value = fut.result()
+                results_by_symbol[sym] = value
+                _cache_set(sym, value)
+
+    for sym in ordered_symbols:
+        out.append({"symbol": sym, "predicted_price": results_by_symbol.get(sym)})
+
+    total_elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    logger.info(
+        "predict_all_from_yahoo symbols=%d computed=%d cache_hits=%d yahoo_ms=%.1f total_ms=%.1f workers=%d",
+        len(ordered_symbols),
+        len(to_compute),
+        len(ordered_symbols) - len(to_compute),
+        yahoo_elapsed_ms,
+        total_elapsed_ms,
+        PREDICT_ALL_MAX_WORKERS,
+    )
 
     return out
