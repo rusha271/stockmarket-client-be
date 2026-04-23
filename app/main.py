@@ -3,9 +3,10 @@
 from contextlib import asynccontextmanager
 
 import xgboost as xgb
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import Settings
@@ -61,8 +62,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# CORS must be configured at app level so browser preflight (OPTIONS) is handled.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(router, tags=["prediction"])
 app.include_router(auth_router)
+
+
+@app.options("/{full_path:path}")
+async def options_fallback(full_path: str):
+    """Fallback for OPTIONS requests not matched by other routes."""
+    return Response(status_code=204)
 
 
 @app.get("/health")
